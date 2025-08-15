@@ -1,0 +1,5 @@
+google-genai==1.29
+pydub==0.25.1
+edgeable
+twilio
+flask
