@@ -5,7 +5,8 @@ import os
 import threading
 import random
 import logging
-from collections import deque
+import time
+import queue
 from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from google import genai
@@ -18,8 +19,6 @@ logger = logging.getLogger("read2me")
 
 graph = GraphDatabase()
 client = genai.Client(api_key=genai_key)
-
-story_summary = "This story is the original Winnie the Pooh universe and is in the style and tone of the original author. The reader is making decisions for how Winnie the Pooh will behave in the story, following typical actions and decisions that this character would typically make. The story starts with Poo discovering in the first few pages that the tree that holds the beehive has fallen and the bees need help finding a new home. Throught the rest of the story he works with Christopher Robin to help the bees move into a new home in a new tree. By the end of the story, the bees share their appreciation by giving Pooh and his friends some honey. The story is about friendship, helping others, and the joy of sharing. It is a lighthearted and fun story that is suitable for children of all ages."
 
 voice_config = types.GenerateContentConfig(
     response_modalities=["AUDIO"],
@@ -48,12 +47,12 @@ voice_config = types.GenerateContentConfig(
 )
 
 # Create an async queue for pages that need to be loaded
-queue = deque([])
+q = queue.Queue(maxsize=50)
 def task_runner():
     while True:
-        if(not len(queue)==0):
-            task = queue.pop()
-            get_next_page(task["id"], task["prompt"])
+        task = q.get()
+        get_next_page(task["id"], task["prompt"])
+        time.sleep(0.1)
 
 # Start multiple threads to process the queue
 for index in range(5):
@@ -64,91 +63,88 @@ def get_next_page(pageId, prompt):
 
     # Check if the page already exists in the graph and has a story
     # and if the audio file for the page exists
-    pageNode = None
     if graph.get_node(pageId) is not None and graph.get_node(pageId).get_property("story") is not None and os.path.exists(f"./audio/{pageId}.wav"):
-        pageNode = graph.get_node(pageId)
-    else:        
+        return graph.get_node(pageId)
 
-        # Define the response schema for the Gemini model
-        class ResponsePage(BaseModel):
-            story: str
-            prompts: list[str]
+    # Define the response schema for the Gemini model
+    class ResponsePage(BaseModel):
+        story: str
+        prompts: list[str]
 
-        # Generate the story page using the Gemini model
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction="You are a choose your own adventure story generator for kids. I will provide a story summary, and a portion of the story text. You create story pages that will take about one minute to read, followed by instructions for chosing the next path in the story.  Don't reveal key plot elements until after the first several pages. The fullstory is about 15 pages in length, with a clear beginning, middle, and end with a kid-friendly moral.  All responses are in the form of a raw json object convert to a string that has a 'story' attribute with the portion that is read to the user, as well as a 'prompts' attribute which is an array of strings that describe specific different actions the listener can take to continue the plot. There are between two and four possible actions for the reader to chose, only if the story has come to a conculsion and at the end should there be zero actions to chose from.'",
-                response_mime_type="application/json",
-                response_schema=list[ResponsePage]
-            ),
-        )
-        respobj = json.loads(response.text[response.text.find("{"):1+response.text.rfind("}")])
+    # Generate the story page using the Gemini model
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction="You are a choose your own adventure story generator for kids. I will provide a story summary, and a portion of the story text. You create story pages that will take about one minute to read, followed by instructions for chosing the next path in the story.  Don't reveal key plot elements until after the first several pages. The fullstory is about 15 pages in length, with a clear beginning, middle, and end with a kid-friendly moral.  All responses are in the form of a raw json object convert to a string that has a 'story' attribute with the portion that is read to the user, as well as a 'prompts' attribute which is an array of strings that describe specific different actions the listener can take to continue the plot. There are between two and four possible actions for the reader to chose, only if the story has come to a conculsion and at the end should there be zero actions to chose from.'",
+            response_mime_type="application/json",
+            response_schema=list[ResponsePage]
+        ),
+    )
+    respobj = json.loads(response.text[response.text.find("{"):1+response.text.rfind("}")])
 
-        pageNode = graph.put_node(pageId, {'type': 'page'})
-        pageNode.set_property("story", respobj["story"])
-        prompts = respobj["prompts"]
-        for prompt in prompts:
-            promptNode = graph.put_node(str(uuid.uuid4()), {'type': 'page', 'story': None})
-            pageNode.attach(promptNode, {'type':'action', 'action': prompt})
-            promptNode.attach(pageNode, {'type':'previous'})    
+    pageNode = graph.put_node(pageId, {'type': 'page'})
+    pageNode.set_property("story", respobj["story"])
+    prompts = respobj["prompts"]
+    for prompt in prompts:
+        promptNode = graph.put_node(str(uuid.uuid4()), {'type': 'page', 'story': None})
+        pageNode.attach(promptNode, {'type':'action', 'action': prompt})
+        promptNode.attach(pageNode, {'type':'previous'})    
 
-        # Add the story page content
-        contents = "Lee: " + respobj["story"] + "\n"
+    # Add the story page content
+    contents = "Lee: " + respobj["story"] + "\n"
 
-        # Add the action choices
-        numbers = [
-            "one",
-            "two",
-            "three",
-            "four"
-        ]
+    # Add the action choices
+    numbers = [
+        "one",
+        "two",
+        "three",
+        "four"
+    ]
+    contents += random.choice([
+        "Katie: Now it is your turn to help us continue the story. You can choose what happens next: ",
+        "Katie: What do you think should happen next? ",
+        "Katie: I'm enjoying this story. What do you want to happen next? ",
+        "Katie: Now its your turn. Pick what happens next in our story. ",
+        "Katie: Let's see what happens next. You can choose what happens next in the story. ",
+        "Katie: "
+    ])
+    for index, prompt in enumerate(respobj["prompts"]):
+        contents += "Press " + numbers[index] + " for " + prompt
+
+    # If there are no prompts, then this is the end of the story
+    if(len(respobj["prompts"]) == 0):
+        contents = "Lee: The end!\n"
         contents += random.choice([
-            "Katie: Now it is your turn to help us continue the story. You can choose what happens next: ",
-            "Katie: What do you think should happen next? ",
-            "Katie: I'm enjoying this story. What do you want to happen next? ",
-            "Katie: Now its your turn. Pick what happens next in our story. ",
-            "Katie: Let's see what happens next. You can choose what happens next in the story. ",
-            "Katie: "
+            "Katie: Well, that's the end of our story. I hope you enjoyed it! If you want to hear it again, just call back and we can read it together.\n",
+            "Katie: That was a great story! I hope you enjoyed it. If you want to another story, just call back and we can keep reading together!\n",
+            "Katie: I had a lot of fun reading this story with you! If you want to hear it again, just call back and we can read it together. See you next time!\n"
         ])
-        for index, prompt in enumerate(respobj["prompts"]):
-            contents += "Press " + numbers[index] + " for " + prompt
+        contents += random.choice([
+            "Lee: Goodbye for now!\n",
+            "Lee: Thanks for reading with us! Goodbye!\n",
+            "Lee: I hope you enjoyed the story! Goodbye!\n",
+            "Lee: It was fun reading with you! Goodbye!\n",
+        ])
 
-        # If there are no prompts, then this is the end of the story
-        if(len(respobj["prompts"]) == 0):
-            contents = "Lee: The end!\n"
-            contents += random.choice([
-                "Katie: That's the end of our story. I hope you enjoyed it! If you want to hear it again, just call back and we can read it together.\n",
-                "Katie: That was a great story! I hope you enjoyed it. If you want to another story, just call back and we can keep reading together!\n",
-                "Katie: I had a lot of fun reading this story with you! If you want to hear it again, just call back and we can read it together. See you next time!\n"
-            ])
-            contents += random.choice([
-                "Lee: Goodbye for now!\n",
-                "Lee: Thanks for reading with us! Goodbye!\n",
-                "Lee: I hope you enjoyed the story! Goodbye!\n",
-                "Lee: It was fun reading with you! Goodbye!\n",
-            ])
-
-        # Generate the audio for the story page using the Gemini model
-        try:
-            audio_data = client.models.generate_content(
-                model="gemini-2.5-flash-preview-tts",
-                contents=contents,
-                config=voice_config
-            ).candidates[0].content.parts[0].inline_data.data
-            with wave.open(f"./audio/{pageId}.wav", 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(24000)
-                wf.writeframes(audio_data)
-        except Exception as e:
-            # TODO handle by re-enqueing?
-            logger.error(f"Error generating audio for page {pageId}: {e}")
-            return None
+    # Generate the audio for the story page using the Gemini model
+    try:
+        audio_data = client.models.generate_content(
+            model="gemini-2.5-flash-preview-tts",
+            contents=contents,
+            config=voice_config
+        ).candidates[0].content.parts[0].inline_data.data
+        with wave.open(f"./audio/{pageId}.wav", 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(24000)
+            wf.writeframes(audio_data)
+    except Exception as e:
+        # TODO handle by re-enqueing?
+        logger.error(f"Error generating audio for page {pageId}: {e}")
+        return None
         
     graph.save()
-
     return pageNode
 
 intros = [
@@ -199,29 +195,30 @@ for intro_index, intro in enumerate(intros):
             wf.setframerate(24000)
             wf.writeframes(audio_data)
 
-# Make sure the first page of the story is available
+# If there isn't already a story starting node, create one
 startNodes = graph.get_nodes(lambda node: node.get_property("type")=="start")
-if len(startNodes)>0:
+if len(startNodes)==0:
+    story_summary = "This story is the original Winnie the Pooh universe and is in the style and tone of the original author. The reader is making decisions for how Winnie the Pooh will behave in the story, following typical actions and decisions that this character would typically make. The story starts with Poo discovering in the first few pages that the tree that holds the beehive has fallen and the bees need help finding a new home. Throught the rest of the story he works with Christopher Robin to help the bees move into a new home in a new tree. By the end of the story, the bees have been moved to a new tree and share their appreciation by giving Pooh and his friends some honey. The story is about friendship, helping others, and the joy of sharing. It is a lighthearted and fun story that is suitable for children of all ages."
 
-    # If there is already a starting node, use it
-    pageNode = startNodes[0]
-    if not os.path.exists(f"./audio/{pageNode.get_id()}.wav"):
-        get_next_page(pageNode.get_id(), f"{story_summary}\n Respond with the first page of the story.")
-
-else:
-
-    # If there isn't already a starting node, create one
     pageId = str(uuid.uuid4())
     pageNode = get_next_page(pageId, f"{story_summary}\n Respond with the first page of the story.")
     # TODO add the story outline to the starting node
     pageNode.set_property("type", "start")
+    pageNode.set_property("summary", story_summary)
     graph.save()
+
+    startNodes = graph.get_nodes(lambda node: node.get_property("type")=="start")
+
+# Choose a story starting node at random
+pageNode = random.choice(startNodes)
+if not os.path.exists(f"./audio/{pageNode.get_id()}.wav"):
+    get_next_page(pageNode.get_id(), f"{pageNode.get_property("summary")}\n Respond with the first page of the story.")
 
 # Enqueue the next possible actions for the first page
 for edge in pageNode.get_edges(lambda edge: edge.get_property('type')=='action'):
-    queue.append({
+    q.put({
         "id": edge.get_destination().get_id(), 
-        "prompt": story_summary + "\n Here is the first page of the story: "+pageNode.get_property("story")+"\n Respond with the next page of the story once the user chooses the action '"+edge.get_property("action")+"'"
+        "prompt": pageNode.get_property("summary") + "\n Here is the first page of the story: "+pageNode.get_property("story")+"\n Respond with the next page of the story once the user chooses the action '"+edge.get_property("action")+"'"
     })
 
 # Start the API server
@@ -276,17 +273,19 @@ def next():
     pageCount = 0
     previousEdges = node.get_edges(lambda edge: edge.get_property('type')=='previous')
     previous = None if len(previousEdges) == 0 else previousEdges[0].get_destination()
+    startNode = None
     while previous != None:
         pageCount += 1
         fullStory = str(previous.get_property("story")) + "\n" + fullStory
         previousEdges = previous.get_edges(lambda edge: edge.get_property('type')=='previous')
         previous = None if len(previousEdges) == 0 else previousEdges[0].get_destination()
+        startNode = previous if previous.get_property("type") == "start" else None
 
     # Enqueue the next pages to be generated
     for edge in node.get_edges(lambda edge: edge.get_property('type')=='action'):
-        queue.append({
+        q.put({
             "id": edge.get_destination().get_id(), 
-            "prompt": story_summary +"\n Here is the first " + str(pageCount)+" pages of the story so far: "+fullStory+"\nRespond with the next page of the story once the user chooses the action '"+edge.get_property("action")+"'"
+            "prompt": startNode.get_property("summary") +"\n Here is the first " + str(pageCount)+" pages of the story so far: "+fullStory+"\nRespond with the next page of the story once the user chooses the action '"+edge.get_property("action")+"'"
         })
 
     # If the next page's audio file is available, play it
@@ -298,4 +297,5 @@ def next():
     resp.append(gather)
     return str(resp)
 
-app.run(port=8080)
+if __name__ == "__main__":
+    app.run(port=8080)
