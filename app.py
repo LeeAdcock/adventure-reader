@@ -14,8 +14,17 @@ from google.genai import types
 from edgeable import GraphDatabase
 from pydantic import BaseModel
 
-logger = logging.getLogger("read2me")
 
+# Configure logging
+logger = logging.getLogger("read2me")
+logger.setLevel(logging.INFO)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+logger.addHandler(console_handler)
+
+# Configure "google_genai.models:AFC" logger to only show errors
+afc_logger = logging.getLogger("google_genai.models:AFC")
+afc_logger.setLevel(logging.ERROR)
 
 graph = GraphDatabase()
 client = genai.Client(api_key=genai_key)
@@ -66,6 +75,8 @@ def get_next_page(pageId, prompt):
     if graph.get_node(pageId) is not None and graph.get_node(pageId).get_property("story") is not None and os.path.exists(f"./audio/{pageId}.wav"):
         return graph.get_node(pageId)
 
+    logger.info(f"Generating page {pageId}")
+
     # Define the response schema for the Gemini model
     class ResponsePage(BaseModel):
         story: str
@@ -94,29 +105,35 @@ def get_next_page(pageId, prompt):
     # Add the story page content
     contents = "Lee: " + respobj["story"] + "\n"
 
-    # Add the action choices
-    numbers = [
-        "one",
-        "two",
-        "three",
-        "four"
-    ]
-    contents += random.choice([
-        "Katie: Now it is your turn to help us continue the story. You can choose what happens next: ",
-        "Katie: What do you think should happen next? ",
-        "Katie: I'm enjoying this story. What do you want to happen next? ",
-        "Katie: Now its your turn. Pick what happens next in our story. ",
-        "Katie: Let's see what happens next. You can choose what happens next in the story. ",
-        "Katie: "
-    ])
-    for index, prompt in enumerate(respobj["prompts"]):
-        contents += "Press " + numbers[index] + " for " + prompt
+    if(len(respobj["prompts"]) > 0):
 
-    # If there are no prompts, then this is the end of the story
-    if(len(respobj["prompts"]) == 0):
-        contents = "Lee: The end!\n"
+        # Add the action choices
+        numbers = [
+            "one",
+            "two",
+            "three",
+            "four"
+        ]
         contents += random.choice([
-            "Katie: Well, that's the end of our story. I hope you enjoyed it! If you want to hear it again, just call back and we can read it together.\n",
+            "Katie: Now it is your turn to help us continue the story. You can choose what happens next: ",
+            "Katie: What do you think should happen next? ",
+            "Katie: I'm enjoying this story. What do you want to happen next? ",
+            "Katie: Now its your turn. Pick what happens next in our story. ",
+            "Katie: Let's see what happens next. You can choose! ",
+            "Katie: "
+        ])
+        for index, prompt in enumerate(respobj["prompts"]):
+            contents += "Press " + numbers[index] + " for " + prompt
+
+    else:
+
+        # If there are no prompts, then this is the end of the story
+        contents = random.choice([
+            "Lee: The end!\n",
+            "Lee: And that is the end!\n"
+        ])
+        contents += random.choice([
+            "Katie: How fun! I hope you enjoyed it! If you want to hear this story again, just call back and we can read it together.\n",
             "Katie: That was a great story! I hope you enjoyed it. If you want to another story, just call back and we can keep reading together!\n",
             "Katie: I had a lot of fun reading this story with you! If you want to hear it again, just call back and we can read it together. See you next time!\n"
         ])
@@ -218,7 +235,7 @@ if not os.path.exists(f"./audio/{pageNode.get_id()}.wav"):
 for edge in pageNode.get_edges(lambda edge: edge.get_property('type')=='action'):
     q.put({
         "id": edge.get_destination().get_id(), 
-        "prompt": pageNode.get_property("summary") + "\n Here is the first page of the story: "+pageNode.get_property("story")+"\n Respond with the next page of the story once the user chooses the action '"+edge.get_property("action")+"'"
+        "prompt": pageNode.get_property("summary")+"\n Here is the first page of the story: "+pageNode.get_property("story")+"\n Respond with the next page of the story once the user chooses the action '"+edge.get_property("action")+"'"
     })
 
 # Start the API server
@@ -244,12 +261,10 @@ def voice():
 @app.route("/next", methods=['GET', 'POST'])
 def next():
 
-
     # Get the current node
     node = graph.get_node(request.args.get('id'))
 
     # Ge the user's choice for the next story action
-    # TODO: handle an invalid number selected
     selected_prompt = int(request.values['Digits'])-1
     if selected_prompt < 0 or selected_prompt >= len(node.get_edges(lambda edge: edge.get_property('type')=='action')):
         resp = VoiceResponse()
@@ -261,6 +276,8 @@ def next():
 
     # If this audio isn't available yet, then introduce a delay
     if not os.path.exists(f"./audio/{node.get_id()}.wav"):
+        
+        logger.info(f"Audio for page {node.get_id()} not available yet, waiting for it to be generated.")
 
         resp = VoiceResponse()
         resp.play(f"{domain}/audio/flip.wav")
